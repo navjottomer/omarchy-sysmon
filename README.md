@@ -3,6 +3,14 @@
 CPU / memory / disk / network for the Omarchy bar. Click the bar label to open
 the breakdown; right-click (or Enter in the panel) jumps straight to btop.
 
+## Install
+
+    git clone https://github.com/navjottomer/omarchy-sysmon \
+      ~/.config/omarchy/plugins/navjottomer.sysmon
+
+Then add `{"id": "navjottomer.sysmon"}` to a bar section in
+`~/.config/omarchy/shell.json` and run `omarchy restart shell`.
+
 ## Shape
 
 - `Panel.qml` — the whole widget. Extends `qs.Ui/Panel`, so it registers as a

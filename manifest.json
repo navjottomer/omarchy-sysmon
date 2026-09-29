@@ -4,6 +4,7 @@
   "name": "System monitor",
   "version": "1.0.0",
   "author": "navjottomer",
+  "license": "MIT",
   "description": "CPU, disk and network at a glance, with a panel breakdown and a shortcut to btop",
   "kinds": [
     "bar-widget"
