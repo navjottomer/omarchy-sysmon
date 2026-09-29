@@ -1,27 +1,39 @@
 #!/usr/bin/env bash
-# Streams one JSON object per line every INTERVAL seconds. `label` is the bar
-# text (a 2x2 CPU/disk/net block, \v separating its two rows); everything else
-# is raw numbers for the panel to format and lay out itself.
+# Streams one JSON object per line every INTERVAL seconds: raw numbers for the
+# panel to format, lay out and put on the bar itself.
 # Consumed by Panel.qml in this plugin.
 #
 # Everything on the hot path reads /proc or /sys and writes through `printf -v`,
 # so a steady-state tick forks nothing at all — no `$( )` subshells, no external
-# binaries. The only exceptions are `df` (every df_every ticks) and `sleep`.
+# binaries, not even `sleep`: the wait between ticks is a timed read on stdin.
+# The only exception is `df` (every df_every seconds).
+#
+# The panel writes one word per line on stdin:
+#   open   the panel is on screen: also sample processes and the NVIDIA GPU
+#   close  the panel is gone: stop both (the GPU after gpu_linger seconds)
+# Stdin closing means the panel is gone for good, so the script exits.
+#
+# Options: --gpu-always keeps the NVIDIA GPU sampled with the panel closed,
+# for when the bar itself shows the GPU.
 
 interval=2
-df_every=15 # re-run df every df_every ticks (~30s)
+df_every=30    # seconds between df runs
+gpu_linger=60  # seconds nvidia-smi keeps running after the panel closes
+
+gpu_always=0
+[[ ${1:-} == --gpu-always ]] && gpu_always=1
 
 # Bounds on what one record can carry, so the shell never buffers an
 # unbounded line: at most this many list entries, names clipped to this many
 # characters, and the whole record capped at max_record characters (lists are
 # dropped from a record that would exceed it).
-max_mounts=16 max_ifaces=16 max_gpus=8 max_name=64
+max_mounts=16 max_ifaces=16 max_gpus=8 max_name=64 max_drives=8 max_top=5
 max_record=32768
 
-printf -v cpu_icon '\Uf0ee0'  # nf-md-cpu_64_bit
-printf -v disk_icon '\Uf02ca' # nf-md-harddisk
-dn='↓'
-up='↑'
+now_us() { # wall clock in microseconds, into $now_out, without forking
+  local t=$EPOCHREALTIME
+  now_out=$((10#${t//[!0-9]/}))
+}
 
 jstr() { # JSON-escape $1 into $jstr_out
   local s=$1
@@ -157,6 +169,7 @@ net_rx=0 net_tx=0 net_ifaces=""
 
 sample_net() {
   local line name rx tx d_rx d_tx live=0 entry
+  local -A seen=()
   net_rx=0 net_tx=0 net_ifaces=""
 
   while IFS= read -r line; do
@@ -168,13 +181,14 @@ sample_net() {
     read -r rx _ _ _ _ _ _ _ tx _ <<<"${line#*:}"
     [[ $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ ]] || continue
 
+    seen[$name]=1
     d_rx=$((rx - ${net_prev_rx[$name]:-rx}))
     d_tx=$((tx - ${net_prev_tx[$name]:-tx}))
     net_prev_rx[$name]=$rx net_prev_tx[$name]=$tx
     ((d_rx < 0)) && d_rx=0 # counter reset on link flap
     ((d_tx < 0)) && d_tx=0
 
-    d_rx=$((d_rx / interval)) d_tx=$((d_tx / interval))
+    d_rx=$((d_rx * 1000000 / dt_us)) d_tx=$((d_tx * 1000000 / dt_us))
     net_rx=$((net_rx + d_rx)) net_tx=$((net_tx + d_tx))
 
     if ((rx > 0 || tx > 0)); then
@@ -186,6 +200,12 @@ sample_net() {
       net_ifaces+="${net_ifaces:+,}$entry"
     fi
   done < /proc/net/dev
+
+  # Forget interfaces that are gone, so short-lived ones (USB tethering,
+  # hotplugged adapters) cannot pile up over a long session.
+  for name in "${!net_prev_rx[@]}"; do
+    [[ -n ${seen[$name]:-} ]] || unset 'net_prev_rx[$name]' 'net_prev_tx[$name]'
+  done
 
   # A single active link makes the per-interface breakdown a repeat of the
   # totals, so only keep it once there is more than one link to compare.
@@ -203,7 +223,7 @@ physical() {
   return 1
 }
 
-disk_prev_r=0 disk_prev_w=0 disk_tick=0
+disk_prev_r=0 disk_prev_w=0
 disk_r=0 disk_w=0 root_pct=0 mounts=""
 
 sample_disk_io() {
@@ -214,8 +234,8 @@ sample_disk_io() {
   done < /proc/diskstats
 
   cur_r=$((sect_r * 512)) cur_w=$((sect_w * 512))
-  disk_r=$(((cur_r - disk_prev_r) / interval))
-  disk_w=$(((cur_w - disk_prev_w) / interval))
+  disk_r=$(((cur_r - disk_prev_r) * 1000000 / dt_us))
+  disk_w=$(((cur_w - disk_prev_w) * 1000000 / dt_us))
   disk_prev_r=$cur_r disk_prev_w=$cur_w
   ((disk_r < 0)) && disk_r=0
   ((disk_w < 0)) && disk_w=0
@@ -244,6 +264,36 @@ refresh_df() {
     tail -n +2 | awk '{ print length($2), $0 }' | sort -n -k1,1 -k3,3 | cut -d" " -f2-)
 }
 
+# NVMe drives report their own temperature and the limit they are rated for,
+# as plain hwmon files. Found once at startup.
+declare -a drive_temp=() drive_json=()
+for h in /sys/class/nvme/nvme*/hwmon*; do
+  [[ -r $h/temp1_input ]] || continue
+  ((${#drive_temp[@]} < max_drives)) || break
+  ctrl=${h%/hwmon*}
+  model=""
+  [[ -r $ctrl/model ]] && read -r model < "$ctrl/model"
+  model=${model%"${model##*[![:space:]]}"}
+  [[ -n $model ]] || model=${ctrl##*/}
+  max=null
+  [[ -r $h/temp1_max ]] && read -r max < "$h/temp1_max" && max=$((max / 1000))
+  ((max > 0)) 2>/dev/null || max=null
+  clip "${model//_/ }" "$max_name"; jstr "$clip_out"
+  drive_temp+=("$h/temp1_input")
+  drive_json+=("{\"name\":$jstr_out,\"max\":$max,\"temp\":")
+done
+
+drives=""
+sample_drives() {
+  local i t
+  drives=""
+  for i in "${!drive_temp[@]}"; do
+    t=null
+    read -r t 2>/dev/null < "${drive_temp[i]}" && [[ $t =~ ^-?[0-9]+$ ]] && t=$((t / 1000)) || t=null
+    drives+="${drives:+,}${drive_json[i]}$t}"
+  done
+}
+
 # ---------------------------------------------------------------- gpu
 
 # AMD cards expose load, VRAM and sensors as plain sysfs files, so they cost
@@ -262,17 +312,28 @@ done
 # NVIDIA has no sysfs counters; nvidia-smi's own loop mode (-lms) keeps one
 # long-lived process that prints a CSV line per GPU each interval. The loop
 # below only drains whatever it has written, so a tick still forks nothing.
-# If it dies (driver reload), it is restarted every 30 ticks.
-nv_lines=() nv_restart=0
+# It only runs while something shows the GPU (the open panel, or the bar with
+# --gpu-always), so a closed panel costs no nvidia-smi process at all. If it
+# dies (driver reload) while wanted, it is restarted every 30 ticks.
+nv_lines=() nv_restart=0 nv_wanted=$gpu_always nv_stop_at=0
+nvsmi=""
+for d in /usr/bin /bin /opt/bin; do [[ -x $d/nvidia-smi ]] && nvsmi=$d/nvidia-smi && break; done
 start_nvsmi() {
-  command -v nvidia-smi >/dev/null 2>&1 || return
+  [[ -n $nvsmi ]] || return
+  [[ -n ${NVSMI_PID:-} ]] && kill -0 "$NVSMI_PID" 2>/dev/null && return
   coproc NVSMI {
-    exec nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+    exec "$nvsmi" --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
       --format=csv,noheader,nounits -lms $((interval * 1000)) 2>/dev/null
   }
 }
-start_nvsmi
-trap '[[ -n ${NVSMI_PID:-} ]] && kill "$NVSMI_PID" 2>/dev/null' EXIT
+stop_nvsmi() {
+  [[ -n ${NVSMI_PID:-} ]] && kill "$NVSMI_PID" 2>/dev/null
+  wait "${NVSMI_PID:-}" 2>/dev/null
+  unset NVSMI_PID
+  nv_lines=()
+}
+((nv_wanted)) && start_nvsmi
+trap stop_nvsmi EXIT
 trap 'exit 0' TERM INT HUP
 
 gpus=""
@@ -281,6 +342,12 @@ gpus=""
 # are simply overwritten.
 drain_nvsmi() {
   local line idx
+  if ((!nv_wanted)); then
+    # Linger a while after the panel closes, so quickly reopening it does not
+    # pay for a fresh nvidia-smi start each time.
+    if [[ -n ${NVSMI_PID:-} ]] && ((now_out >= nv_stop_at)); then stop_nvsmi; fi
+    [[ -n ${NVSMI_PID:-} ]] || return
+  fi
   if [[ -z ${NVSMI_PID:-} ]] || ! kill -0 "$NVSMI_PID" 2>/dev/null; then
     nv_lines=()
     if ((nv_restart++ % 30 == 0)); then start_nvsmi; fi
@@ -320,12 +387,12 @@ sample_gpu() {
   done
   for i in "${!amd_dev[@]}"; do
     busy=null vused=null vtotal=null t=null pw=null
-    read -r busy < "${amd_dev[i]}/gpu_busy_percent" 2>/dev/null
-    read -r vused < "${amd_dev[i]}/mem_info_vram_used" 2>/dev/null
-    read -r vtotal < "${amd_dev[i]}/mem_info_vram_total" 2>/dev/null
+    read -r busy 2>/dev/null < "${amd_dev[i]}/gpu_busy_percent"
+    read -r vused 2>/dev/null < "${amd_dev[i]}/mem_info_vram_used"
+    read -r vtotal 2>/dev/null < "${amd_dev[i]}/mem_info_vram_total"
     if [[ -n ${amd_hwmon[i]} ]]; then
-      read -r t < "${amd_hwmon[i]}/temp1_input" 2>/dev/null && t=$((t / 1000))
-      read -r pw < "${amd_hwmon[i]}/power1_input" 2>/dev/null && pw=$((pw / 1000000))
+      read -r t 2>/dev/null < "${amd_hwmon[i]}/temp1_input" && t=$((t / 1000))
+      read -r pw 2>/dev/null < "${amd_hwmon[i]}/power1_input" && pw=$((pw / 1000000))
     fi
     num_or_null "$busy"; busy=$num_out
     num_or_null "$vused"; vused=$num_out
@@ -338,19 +405,110 @@ sample_gpu() {
   done
 }
 
+# ---------------------------------------------------------------- processes
+
+# Only while the panel is open: one pass over /proc/<pid>/stat per tick, which
+# costs a few milliseconds and would be wasted on a closed panel. CPU is
+# measured like top, as a share of one thread (so 250% is 2.5 threads busy).
+procs_on=0
+declare -A proc_a=() proc_b=() proc_name=()
+proc_flip=0
+top_cpu="" top_mem=""
+hz=100 page=4096
+
+# Keep the $max_top largest values seen so far in two parallel arrays,
+# largest first, without forking sort. $3 is the pid the value belongs to.
+top_insert() { # $1 array-name prefix, $2 value, $3 pid
+  local -n tv=$1_v tp=$1_p
+  local i n=${#tv[@]}
+  ((n >= max_top && $2 <= tv[n - 1])) && return
+  for ((i = 0; i < n; i++)); do (($2 > tv[i])) && break; done
+  tv=("${tv[@]:0:i}" "$2" "${tv[@]:i}")
+  tp=("${tp[@]:0:i}" "$3" "${tp[@]:i}")
+  if ((${#tv[@]} > max_top)); then
+    tv=("${tv[@]:0:max_top}")
+    tp=("${tp[@]:0:max_top}")
+  fi
+}
+
+top_json() { # $1 array-name prefix, $2 value key, into $top_out
+  local -n tv=$1_v tp=$1_p
+  local i entry
+  top_out=""
+  for i in "${!tp[@]}"; do
+    clip "${proc_name[${tp[i]}]}" 32; jstr "$clip_out"
+    printf -v entry '{"name":%s,"%s":%d}' "$jstr_out" "$2" "${tv[i]}"
+    top_out+="${top_out:+,}$entry"
+  done
+}
+
+reset_procs() {
+  proc_a=() proc_b=() proc_name=()
+}
+
+sample_procs() {
+  local f line pid ticks rss prev d
+  local -a tc_v=() tc_p=() tm_v=() tm_p=()
+  # Two tables take turns as this pass and the previous one, so nothing
+  # is copied between ticks.
+  if ((proc_flip ^= 1)); then
+    local -n cur=proc_a old=proc_b
+  else
+    local -n cur=proc_b old=proc_a
+  fi
+  cur=() proc_name=()
+  for f in /proc/[0-9]*/stat; do
+    read -r line 2>/dev/null < "$f" || continue
+    pid=${line%% *}
+    # After the name, split on spaces: state is field 3, utime 14, stime 15,
+    # rss 24. Those fields are plain numbers and one letter, so no globbing.
+    set -- ${line##*) }
+    ticks=$((${12} + ${13}))
+    rss=$((${22} * page))
+    cur[$pid]=$ticks
+    ((rss > 0)) || continue # kernel threads
+    prev=${old[$pid]:-}
+    if [[ -n $prev ]]; then
+      d=$(((ticks - prev) * 100000000 / (hz * dt_us)))
+      ((d > 0)) && top_insert tc "$d" "$pid"
+    fi
+    top_insert tm "$rss" "$pid"
+  done
+  for pid in "${tc_p[@]}" "${tm_p[@]}"; do
+    [[ -n ${proc_name[$pid]:-} ]] && continue
+    read -r line 2>/dev/null < "/proc/$pid/stat" || line="$pid (?) "
+    line=${line#*(}
+    proc_name[$pid]=${line%)*}
+  done
+  top_json tc pct; top_cpu=$top_out
+  top_json tm mem; top_mem=$top_out
+}
+
 # ---------------------------------------------------------------- loop
 
 first=1
 uptime_s=0
+now_us; last_us=$now_out
+next_df_us=0
+wait_us=400000 # the first real tick comes soon after the baseline sample
 
 while :; do
+  now_us
+  dt_us=$((now_out - last_us))
+  ((dt_us > 0)) || dt_us=1
+  last_us=$now_out
+
   sample_cpu
   sample_mem
   sample_net
   sample_disk_io
+  sample_drives
   sample_gpu
-  ((disk_tick % df_every == 0)) && refresh_df
-  disk_tick=$((disk_tick + 1))
+  if ((procs_on)); then sample_procs; else top_cpu="" top_mem=""; fi
+  if ((now_out >= next_df_us)); then
+    refresh_df
+    next_df_us=$((now_out + df_every * 1000000))
+  fi
 
   read -r uptime_s _ < /proc/uptime
   uptime_s=${uptime_s%%.*}
@@ -360,37 +518,53 @@ while :; do
     # The first deltas are measured against boot, so throw them away and take a
     # quick second sample instead of showing an all-time average.
     first=0
-    sleep 0.4
-    continue
-  fi
-
-  # Bar label: CPU over disk on the left, download over upload on the right.
-  rate "$net_rx"; net_rx_s=$rate_out
-  rate "$net_tx"; net_tx_s=$rate_out
-  printf -v label '%s %3d%%  %s%4s\v%s %3d%%  %s%4s' \
-    "$cpu_icon" "$cpu_pct" "$dn" "$net_rx_s" \
-    "$disk_icon" "$root_pct" "$up" "$net_tx_s"
-
-  jstr "$label"; jlabel=$jstr_out
-  jstr "$load1 $load5 $load15"; jload=$jstr_out
-
-  printf -v record '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]},"gpus":[%s]}' \
-    "$jlabel" "$uptime_s" \
-    "$cpu_pct" "${cpu_temp:-null}" "$jload" "$ncpu" "$cores" \
-    "$mem_used" "$mem_total" "$mem_pct" "$swap_used" "$swap_total" "$swap_pct" \
-    "$net_rx" "$net_tx" "$net_ifaces" \
-    "$root_pct" "$disk_r" "$disk_w" "$mounts" "$gpus"
-  if ((${#record} > max_record)); then
-    # Too big to send whole: keep the numbers, drop the lists.
-    cores="" net_ifaces="" mounts="" gpus=""
-    printf -v record '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]},"gpus":[%s]}' \
-      "$jlabel" "$uptime_s" \
+  else
+    jstr "$load1 $load5 $load15"; jload=$jstr_out
+    fmt='{"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s],"drives":[%s]},"gpus":[%s],"top":{"cpu":[%s],"mem":[%s]}}'
+    printf -v record "$fmt" \
+      "$uptime_s" \
       "$cpu_pct" "${cpu_temp:-null}" "$jload" "$ncpu" "$cores" \
       "$mem_used" "$mem_total" "$mem_pct" "$swap_used" "$swap_total" "$swap_pct" \
       "$net_rx" "$net_tx" "$net_ifaces" \
-      "$root_pct" "$disk_r" "$disk_w" "$mounts" "$gpus"
+      "$root_pct" "$disk_r" "$disk_w" "$mounts" "$drives" "$gpus" "$top_cpu" "$top_mem"
+    if ((${#record} > max_record)); then
+      # Too big to send whole: keep the numbers, drop the lists.
+      printf -v record "$fmt" \
+        "$uptime_s" \
+        "$cpu_pct" "${cpu_temp:-null}" "$jload" "$ncpu" "" \
+        "$mem_used" "$mem_total" "$mem_pct" "$swap_used" "$swap_total" "$swap_pct" \
+        "$net_rx" "$net_tx" "" \
+        "$root_pct" "$disk_r" "$disk_w" "" "" "" "" ""
+    fi
+    printf '%s\n' "$record"
   fi
-  printf '%s\n' "$record"
 
-  sleep "$interval"
+  # Wait for the next tick on stdin instead of forking `sleep`. A command
+  # from the panel ends the wait early; end of input means the panel is gone.
+  deadline_us=$((last_us + wait_us))
+  wait_us=$((interval * 1000000))
+  while :; do
+    now_us
+    left_us=$((deadline_us - now_out))
+    ((left_us > 0)) || break
+    printf -v left '%d.%06d' $((left_us / 1000000)) $((left_us % 1000000))
+    if IFS= read -r -t "$left" -n 16 cmd; then
+      case $cmd in
+        open)
+          procs_on=1 nv_wanted=1
+          start_nvsmi
+          # Take a baseline for the process list and tick again shortly.
+          ((${#proc_a[@]} + ${#proc_b[@]})) || { dt_us=1000000; sample_procs; }
+          deadline_us=$((now_out + 500000))
+          ;;
+        close)
+          procs_on=0 nv_wanted=$gpu_always
+          reset_procs
+          nv_stop_at=$((now_out + gpu_linger * 1000000))
+          ;;
+      esac
+    elif (($? <= 128)); then
+      exit 0 # stdin closed: the panel went away
+    fi
+  done
 done
