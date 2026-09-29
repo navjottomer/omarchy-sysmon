@@ -5,11 +5,11 @@ the breakdown; right-click (or Enter in the panel) jumps straight to btop.
 
 ## Install
 
-    git clone https://github.com/navjottomer/omarchy-sysmon \
-      ~/.config/omarchy/plugins/navjottomer.sysmon
+    omarchy plugin add https://github.com/navjottomer/omarchy-sysmon.git --enable
 
-Then add `{"id": "navjottomer.sysmon"}` to a bar section in
-`~/.config/omarchy/shell.json` and run `omarchy restart shell`.
+This clones it into `~/.config/omarchy/plugins/navjottomer.sysmon/`, validates it, and puts
+it on the bar. Update later with `omarchy plugin update navjottomer.sysmon`, remove with
+`omarchy plugin remove navjottomer.sysmon`.
 
 ## Shape
 
