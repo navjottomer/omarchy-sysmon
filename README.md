@@ -1,54 +1,98 @@
-# navjottomer.sysmon
+# Omarchy System Monitor
 
-CPU / memory / GPU / disk / network for the Omarchy bar. Click the bar label to open
-the breakdown; right-click (or Enter in the panel) jumps straight to btop.
+CPU, memory, GPU, disk and network at a glance in the Omarchy bar. A compact
+two-row label lives in the bar; click it for the full breakdown.
+
+<p align="center"><img src="preview.png" alt="System monitor panel in the Omarchy bar" width="480"></p>
+
+## Features
+
+- **Bar label.** CPU load and root-disk use on the left, download and upload
+  rates on the right, in a two-row block the size of one bar slot.
+- **Panel breakdown.**
+  - **CPU:** total load, per-core bars, load average, temperature, uptime
+  - **Memory:** RAM and swap in use
+  - **GPU:** load, temperature, power and VRAM for NVIDIA and AMD cards,
+    including integrated Radeon graphics
+  - **Network:** download and upload, per interface when more than one is up
+  - **Disk:** read and write rates, space used per filesystem
+- **Busy cores and GPUs turn red** above 85%, in your theme's urgent colour.
+- **One step to btop.** The **Process monitor** button, Enter in the panel, or
+  right-clicking the bar label opens btop.
+- **Follows your theme.** Built from the stock Omarchy panel parts.
+- **Close to free.** The data script reads `/proc` and `/sys` without starting
+  new processes each tick; about 10 ms of CPU every 12 seconds.
+
+## Requirements
+
+- [Omarchy](https://omarchy.org) with the Quickshell-based Omarchy shell
+- `bash`, `coreutils`, `gawk` (present on every Omarchy install)
+- Optional: `nvidia-utils` for NVIDIA GPU stats (`nvidia-smi`). AMD GPUs need
+  nothing extra. Intel GPUs are not shown.
+- Optional: `btop` for the **Process monitor** button (ships with Omarchy)
 
 ## Install
 
-    omarchy plugin add https://github.com/navjottomer/omarchy-sysmon.git --enable
+```sh
+omarchy plugin add https://github.com/navjottomer/omarchy-sysmon.git --enable
+```
 
-This clones it into `~/.config/omarchy/plugins/navjottomer.sysmon/`, validates it, and puts
-it on the bar. Update later with `omarchy plugin update navjottomer.sysmon`, remove with
-`omarchy plugin remove navjottomer.sysmon`.
+This clones the plugin into `~/.config/omarchy/plugins/navjottomer.sysmon/`,
+validates it and puts it on the bar.
 
-## Shape
+## Update
 
-- `Panel.qml` — the whole widget. Extends `qs.Ui/Panel`, so it registers as a
-  bar popout and the bar paints its `Color.accent` open-panel mark for free.
-  That mark is the *only* reason the widget looks "selected" — `WidgetButton`
-  and `BarIconButton` draw no hover border, so a plain custom module can never
-  match the built-ins by styling alone. It has to own a panel.
-- `bin/omarchy-bar-sysmon` — the data source. One
-  long-lived process streaming a JSON line every 2s.
+```sh
+omarchy plugin update navjottomer.sysmon
+```
 
-## Cost
+## Remove
 
-The script's hot path only reads `/proc` and `/sys` and writes results through
-`printf -v`, so a steady-state tick forks nothing — no `$( )` subshells, no
-external binaries. `df` runs every 15th tick and `sleep` once per tick; that is
-all. Measured over a 12s window: ~0ms CPU, against ~10ms for the earlier
-version that used command substitution.
+```sh
+omarchy plugin remove navjottomer.sysmon
+```
 
-GPU: AMD load, VRAM and sensors are sysfs reads like the rest. NVIDIA has no
-sysfs counters, so one long-lived `nvidia-smi -lms 2000` runs alongside
-(~27 MB, ~0ms CPU per 12s) and the loop drains its latest line each tick,
-still without forking. It is started with the script and killed with it.
-With GPU sampling the script measures ~10ms CPU per 12s.
+Nothing else is left behind.
 
-On the QML side, a tick while the panel is **closed** costs one property write.
-`snapshot` holds the payload with nothing bound to it, and the detail
-properties are only refreshed from it when the panel is open (see
-`applySnapshot`). Repeaters are modelled on array *lengths*, not the arrays, so
-delegates survive a tick and only their bindings re-evaluate — otherwise every
-row would be destroyed and rebuilt every 2 seconds.
+## Usage
 
-## Gotchas
+| Action | Result |
+|---|---|
+| click the bar label | open or close the panel |
+| right-click the bar label | open btop |
+| Enter in the panel | open btop |
+| Tab / Shift+Tab | switch to the next bar panel |
+| Esc | close |
 
+## How it works
+
+`bin/omarchy-bar-sysmon` is one long-lived Bash process. Every 2 seconds it
+prints one JSON line with a ready-made bar label and the raw numbers; the
+panel formats and lays them out.
+
+- **CPU, memory, network, disk I/O, AMD GPUs** come from `/proc` and `/sys`,
+  read with Bash built-ins. A normal tick starts no new process.
+- **Disk space** comes from `df`, run every 15th tick (about every 30 s).
+- **NVIDIA GPUs** have no `/sys` counters, so one `nvidia-smi` runs alongside
+  in its own loop mode (about 27 MB, near-zero CPU). The script reads its
+  newest line each tick, and stops it on exit.
+- **No double counting.** VPN, container and bridge interfaces are
+  skipped so traffic is not counted twice; only whole disks count toward I/O.
+
+While the panel is closed, a tick costs the shell a single property write;
+the detail rows update only while the panel is open.
+
+## Development notes
+
+- `Panel.qml` is the whole widget. It extends `qs.Ui/Panel`, which is what
+  makes the bar paint its accent open-panel mark under it — a plain bar module
+  cannot get that mark by styling alone.
 - Glyphs are supplementary-plane (U+F0000+). Write them with `chr(0x…)` from a
-  script; pasting them through a shell heredoc can split them into a BMP
-  private-use char plus a hex digit and you get tofu.
-- The bar label is two rows in a 26px slot. `verticalCenterOffset` lifts it
-  clear of the open-panel mark, which is painted over the bottom 4px — without
-  it the mark sits on the second row's descenders.
-- Editing `Panel.qml` usually hot-reloads, but if a change does not appear run
-  `omarchy restart shell`.
+  script; pasting them through a shell heredoc can split them and give tofu.
+- The label is two rows in a 26 px slot. `verticalCenterOffset` lifts it clear
+  of the open-panel mark painted over the bottom 4 px.
+- If an edit does not show up, run `omarchy restart shell`.
+
+## License
+
+[MIT](LICENSE)
