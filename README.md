@@ -79,6 +79,11 @@ panel formats and lays them out.
 - **No double counting.** VPN, container and bridge interfaces are
   skipped so traffic is not counted twice; only whole disks count toward I/O.
 
+- **Bounded records.** At most 16 mounts, 16 interfaces and 8 GPUs, names
+  clipped to 64 characters, and each record capped at 32 KB (lists are
+  dropped from a record that would exceed it). All system-supplied text is
+  shown as plain text, never as markup.
+
 While the panel is closed, a tick costs the shell a single property write;
 the detail rows update only while the panel is open.
 

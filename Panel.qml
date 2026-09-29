@@ -131,6 +131,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         width: Style.space(13)
         horizontalAlignment: Text.AlignHCenter
         text: statRow.icon
@@ -140,6 +141,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: statRow.key
         color: root.dimForeground
         font.family: root.ff
@@ -148,6 +150,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: valueText
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
@@ -163,6 +166,9 @@ Panel {
     command: [String(Qt.resolvedUrl("bin/omarchy-bar-sysmon")).replace(/^file:\/\//, "")]
     stdout: SplitParser {
       onRead: function (line) {
+        // The script caps each record well below this; anything longer is
+        // not ours to parse.
+        if (line.length > 65536) return
         var data
         try {
           data = JSON.parse(String(line))
@@ -192,6 +198,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: labelText
       anchors.centerIn: parent
       // Lift the block clear of the bar's open-panel mark, which is painted
@@ -248,6 +255,7 @@ Panel {
               spacing: Style.space(1)
 
               Text {
+                textFormat: Text.PlainText
                 text: root.num(root.cpu, "pct", 0) + "%"
                 color: root.barForeground
                 font.family: root.ff
@@ -255,6 +263,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: root.fmtUptime(root.uptime)
                 color: root.dimForeground
                 font.family: root.ff
@@ -269,6 +278,7 @@ Panel {
               spacing: Style.space(3)
 
               Text {
+                textFormat: Text.PlainText
                 anchors.right: parent.right
                 text: "󰻠  CPU · " + root.num(root.cpu, "threads", 0) + " threads"
                 color: root.barForeground
@@ -277,6 +287,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 anchors.right: parent.right
                 text: "󰓅  " + root.num(root.cpu, "load", "—")
                 color: root.dimForeground
@@ -285,6 +296,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 anchors.right: parent.right
                 visible: root.num(root.cpu, "temp", null) !== null
                 text: "󰔏  " + root.num(root.cpu, "temp", 0) + "°C"

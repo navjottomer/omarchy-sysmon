@@ -11,6 +11,13 @@
 interval=2
 df_every=15 # re-run df every df_every ticks (~30s)
 
+# Bounds on what one record can carry, so the shell never buffers an
+# unbounded line: at most this many list entries, names clipped to this many
+# characters, and the whole record capped at max_record characters (lists are
+# dropped from a record that would exceed it).
+max_mounts=16 max_ifaces=16 max_gpus=8 max_name=64
+max_record=32768
+
 printf -v cpu_icon '\Uf0ee0'  # nf-md-cpu_64_bit
 printf -v disk_icon '\Uf02ca' # nf-md-harddisk
 dn='↓'
@@ -24,6 +31,10 @@ jstr() { # JSON-escape $1 into $jstr_out
   s=${s//$'\t'/\\t}
   s=${s//$'\n'/\\n}
   jstr_out="\"$s\""
+}
+
+clip() { # $1 clipped to $2 characters, into $clip_out
+  clip_out=${1:0:$2}
 }
 
 rate() { # bytes-per-second -> at most 4 characters, into $rate_out
@@ -168,7 +179,9 @@ sample_net() {
 
     if ((rx > 0 || tx > 0)); then
       live=$((live + 1))
-      jstr "$name"
+      ((live > max_ifaces)) && continue
+      clip "$name" "$max_name"
+      jstr "$clip_out"
       printf -v entry '{"name":%s,"rx":%d,"tx":%d}' "$jstr_out" "$d_rx" "$d_tx"
       net_ifaces+="${net_ifaces:+,}$entry"
     fi
@@ -217,11 +230,12 @@ refresh_df() {
   while read -r source target used size pcent; do
     [[ -n ${seen[$source]} ]] && continue
     seen[$source]=1
+    ((${#seen[@]} > max_mounts)) && continue
     pcent=${pcent//[^0-9]/}
     [[ $target == / ]] && root_pct=$((10#0$pcent))
-    jstr "$target"; jt=$jstr_out
-    jstr "$used"; ju=$jstr_out
-    jstr "$size"; js=$jstr_out
+    clip "$target" "$max_name"; jstr "$clip_out"; jt=$jstr_out
+    clip "$used" 16; jstr "$clip_out"; ju=$jstr_out
+    clip "$size" 16; jstr "$clip_out"; js=$jstr_out
     printf -v entry '{"target":%s,"used":%s,"size":%s,"pct":%d}' \
       "$jt" "$ju" "$js" "$((10#0$pcent))"
     mounts+="${mounts:+,}$entry"
@@ -238,6 +252,7 @@ declare -a amd_dev=() amd_hwmon=()
 for card in /sys/class/drm/card[0-9]; do
   [[ -r $card/device/vendor && -r $card/device/gpu_busy_percent ]] || continue
   [[ $(<"$card/device/vendor") == 0x1002 ]] || continue
+  ((${#amd_dev[@]} < max_gpus)) || break
   amd_dev+=("$card/device")
   hw=""
   for h in "$card"/device/hwmon/hwmon*; do [[ -d $h ]] && hw=$h && break; done
@@ -273,8 +288,9 @@ drain_nvsmi() {
   fi
   while read -r -t 0 -u "${NVSMI[0]}" 2>/dev/null; do
     IFS= read -r -u "${NVSMI[0]}" line || break
+    ((${#line} <= 512)) || continue
     idx=${line%%,*}
-    [[ $idx =~ ^[0-9]+$ ]] && nv_lines[idx]=$line
+    [[ $idx =~ ^[0-9]+$ ]] && ((idx < max_gpus)) && nv_lines[idx]=$line
   done
 }
 
@@ -289,7 +305,8 @@ sample_gpu() {
   for line in "${nv_lines[@]}"; do
     IFS=',' read -r idx name util mused mtotal temp power <<<"$line"
     name=${name# } name=${name#NVIDIA } name=${name#GeForce }
-    jstr "$name"; jn=$jstr_out
+    clip "$name" "$max_name"
+    jstr "$clip_out"; jn=$jstr_out
     num_or_null "${util// /}"; util=$num_out
     num_or_null "${mused// /}"; mused=$num_out
     num_or_null "${mtotal// /}"; mtotal=$num_out
@@ -357,12 +374,23 @@ while :; do
   jstr "$label"; jlabel=$jstr_out
   jstr "$load1 $load5 $load15"; jload=$jstr_out
 
-  printf '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]},"gpus":[%s]}\n' \
+  printf -v record '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]},"gpus":[%s]}' \
     "$jlabel" "$uptime_s" \
     "$cpu_pct" "${cpu_temp:-null}" "$jload" "$ncpu" "$cores" \
     "$mem_used" "$mem_total" "$mem_pct" "$swap_used" "$swap_total" "$swap_pct" \
     "$net_rx" "$net_tx" "$net_ifaces" \
     "$root_pct" "$disk_r" "$disk_w" "$mounts" "$gpus"
+  if ((${#record} > max_record)); then
+    # Too big to send whole: keep the numbers, drop the lists.
+    cores="" net_ifaces="" mounts="" gpus=""
+    printf -v record '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]},"gpus":[%s]}' \
+      "$jlabel" "$uptime_s" \
+      "$cpu_pct" "${cpu_temp:-null}" "$jload" "$ncpu" "$cores" \
+      "$mem_used" "$mem_total" "$mem_pct" "$swap_used" "$swap_total" "$swap_pct" \
+      "$net_rx" "$net_tx" "$net_ifaces" \
+      "$root_pct" "$disk_r" "$disk_w" "$mounts" "$gpus"
+  fi
+  printf '%s\n' "$record"
 
   sleep "$interval"
 done
