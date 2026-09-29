@@ -3,7 +3,7 @@
 CPU, memory, GPU, disk and network at a glance in the Omarchy bar. A compact
 two-row label lives in the bar; click it for the full breakdown.
 
-<p align="center"><img src="preview.png" alt="System monitor panel in the Omarchy bar" width="480"></p>
+<p align="center"><img src="preview.png" alt="System monitor panel, settings screen and the three bar layouts" width="760"></p>
 
 ## Features
 
