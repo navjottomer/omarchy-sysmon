@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# Streams one JSON object per line every INTERVAL seconds. `label` is the bar
+# text (a 2x2 CPU/disk/net block, \v separating its two rows); everything else
+# is raw numbers for the panel to format and lay out itself.
+# Consumed by Panel.qml in this plugin.
+#
+# Everything on the hot path reads /proc or /sys and writes through `printf -v`,
+# so a steady-state tick forks nothing at all — no `$( )` subshells, no external
+# binaries. The only exceptions are `df` (every df_every ticks) and `sleep`.
+
+interval=2
+df_every=15 # re-run df every df_every ticks (~30s)
+
+printf -v cpu_icon '\Uf0ee0'  # nf-md-cpu_64_bit
+printf -v disk_icon '\Uf02ca' # nf-md-harddisk
+dn='↓'
+up='↑'
+
+jstr() { # JSON-escape $1 into $jstr_out
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\v'/\\u000b}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\n'/\\n}
+  jstr_out="\"$s\""
+}
+
+rate() { # bytes-per-second -> at most 4 characters, into $rate_out
+  local b=$1
+  if ((b < 1024)); then
+    printf -v rate_out '%dB' "$b"
+  elif ((b < 1024 * 1024)); then
+    printf -v rate_out '%dK' $((b / 1024))
+  elif ((b < 10 * 1024 * 1024)); then
+    printf -v rate_out '%d.%dM' $((b / 1048576)) $(((b % 1048576) * 10 / 1048576))
+  elif ((b < 1024 * 1024 * 1024)); then
+    printf -v rate_out '%dM' $((b / 1048576))
+  else
+    printf -v rate_out '%d.%dG' $((b / 1073741824)) $(((b % 1073741824) * 10 / 1073741824))
+  fi
+}
+
+# ---------------------------------------------------------------- cpu
+
+# Locate a CPU temperature input once, if this machine exposes one.
+tempfile=""
+for hw in /sys/class/hwmon/hwmon*; do
+  [[ -r $hw/name ]] || continue
+  case "$(<"$hw/name")" in
+    k10temp | zenpower | coretemp)
+      for f in "$hw"/temp*_input; do
+        [[ -r $f ]] && tempfile=$f && break
+      done
+      ;;
+  esac
+  [[ -n $tempfile ]] && break
+done
+
+cpu_prev_idle=0 cpu_prev_total=0
+cpu_pct=0 cpu_temp="" ncpu=0
+declare -a core_prev_idle=() core_prev_total=()
+cores=""
+
+# One pass over /proc/stat covers the aggregate and every core, so the per-core
+# breakdown the panel draws costs nothing beyond the read already being done.
+sample_cpu() {
+  local name user nice sys idle iowait irq softirq steal idle_all total
+  local d_total d_idle pct i=0 millideg
+  cores=""
+
+  while read -r name user nice sys idle iowait irq softirq steal _; do
+    [[ $name == cpu* ]] || break
+    idle_all=$((idle + iowait))
+    total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
+
+    if [[ $name == cpu ]]; then
+      d_total=$((total - cpu_prev_total))
+      d_idle=$((idle_all - cpu_prev_idle))
+      cpu_prev_total=$total cpu_prev_idle=$idle_all
+      ((d_total > 0)) && cpu_pct=$(((100 * (d_total - d_idle) + d_total / 2) / d_total)) || cpu_pct=0
+      continue
+    fi
+
+    d_total=$((total - ${core_prev_total[i]:-total}))
+    d_idle=$((idle_all - ${core_prev_idle[i]:-idle_all}))
+    core_prev_total[i]=$total core_prev_idle[i]=$idle_all
+    ((d_total > 0)) && pct=$(((100 * (d_total - d_idle) + d_total / 2) / d_total)) || pct=0
+    cores+="${cores:+,}$pct"
+    i=$((i + 1))
+  done < /proc/stat
+
+  ncpu=$i
+
+  cpu_temp=""
+  if [[ -n $tempfile ]]; then
+    read -r millideg < "$tempfile"
+    cpu_temp=$((millideg / 1000))
+  fi
+}
+
+# ---------------------------------------------------------------- memory
+
+mem_used=0 mem_total=0 mem_pct=0
+swap_used=0 swap_total=0 swap_pct=0
+
+# MemAvailable is the kernel's own estimate of what a new workload could claim,
+# which is what "used" should be measured against — MemFree alone would count
+# every reclaimable cache page as used and read alarmingly high.
+sample_mem() {
+  local key val total=0 avail=0 stotal=0 sfree=0
+  while read -r key val _; do
+    case $key in
+      MemTotal:) total=$val ;;
+      MemAvailable:) avail=$val ;;
+      SwapTotal:) stotal=$val ;;
+      SwapFree:)
+        sfree=$val
+        break # last field of interest; skip the rest of the file
+        ;;
+    esac
+  done < /proc/meminfo
+
+  mem_total=$((total * 1024))
+  mem_used=$(((total - avail) * 1024))
+  ((total > 0)) && mem_pct=$(((100 * (total - avail) + total / 2) / total)) || mem_pct=0
+
+  swap_total=$((stotal * 1024))
+  swap_used=$(((stotal - sfree) * 1024))
+  ((stotal > 0)) && swap_pct=$(((100 * (stotal - sfree) + stotal / 2) / stotal)) || swap_pct=0
+}
+
+# ---------------------------------------------------------------- network
+
+# Overlay interfaces (VPN, containers, bridges) carry traffic that is already
+# counted on the physical link underneath, so counting them would double up.
+skip_iface() {
+  case $1 in
+    lo | veth* | docker* | br-* | virbr* | tailscale* | tun* | tap* | wg* | vmnet* | vboxnet* | ifb*) return 0 ;;
+  esac
+  return 1
+}
+
+declare -A net_prev_rx net_prev_tx
+net_rx=0 net_tx=0 net_ifaces=""
+
+sample_net() {
+  local line name rx tx d_rx d_tx live=0 entry
+  net_rx=0 net_tx=0 net_ifaces=""
+
+  while IFS= read -r line; do
+    [[ $line == *:* ]] || continue
+    name=${line%%:*}
+    name=${name// /}
+    skip_iface "$name" && continue
+
+    read -r rx _ _ _ _ _ _ _ tx _ <<<"${line#*:}"
+    [[ $rx =~ ^[0-9]+$ && $tx =~ ^[0-9]+$ ]] || continue
+
+    d_rx=$((rx - ${net_prev_rx[$name]:-rx}))
+    d_tx=$((tx - ${net_prev_tx[$name]:-tx}))
+    net_prev_rx[$name]=$rx net_prev_tx[$name]=$tx
+    ((d_rx < 0)) && d_rx=0 # counter reset on link flap
+    ((d_tx < 0)) && d_tx=0
+
+    d_rx=$((d_rx / interval)) d_tx=$((d_tx / interval))
+    net_rx=$((net_rx + d_rx)) net_tx=$((net_tx + d_tx))
+
+    if ((rx > 0 || tx > 0)); then
+      live=$((live + 1))
+      jstr "$name"
+      printf -v entry '{"name":%s,"rx":%d,"tx":%d}' "$jstr_out" "$d_rx" "$d_tx"
+      net_ifaces+="${net_ifaces:+,}$entry"
+    fi
+  done < /proc/net/dev
+
+  # A single active link makes the per-interface breakdown a repeat of the
+  # totals, so only keep it once there is more than one link to compare.
+  ((live > 1)) || net_ifaces=""
+}
+
+# ---------------------------------------------------------------- disk
+
+# Whole disks only — partitions and dm/loop/zram devices would double-count the
+# same physical I/O.
+physical() {
+  case $1 in
+    nvme[0-9]*n[0-9] | sd[a-z] | sd[a-z][a-z] | vd[a-z] | hd[a-z] | mmcblk[0-9]) return 0 ;;
+  esac
+  return 1
+}
+
+disk_prev_r=0 disk_prev_w=0 disk_tick=0
+disk_r=0 disk_w=0 root_pct=0 mounts=""
+
+sample_disk_io() {
+  local sect_r=0 sect_w=0 name f6 f10 cur_r cur_w
+  while read -r _ _ name _ _ f6 _ _ _ f10 _; do
+    physical "$name" || continue
+    sect_r=$((sect_r + f6)) sect_w=$((sect_w + f10))
+  done < /proc/diskstats
+
+  cur_r=$((sect_r * 512)) cur_w=$((sect_w * 512))
+  disk_r=$(((cur_r - disk_prev_r) / interval))
+  disk_w=$(((cur_w - disk_prev_w) / interval))
+  disk_prev_r=$cur_r disk_prev_w=$cur_w
+  ((disk_r < 0)) && disk_r=0
+  ((disk_w < 0)) && disk_w=0
+}
+
+refresh_df() {
+  local -A seen=()
+  local source target used size pcent entry jt ju js
+  mounts="" root_pct=0
+  # Btrfs subvolumes all report the same filesystem, so list each backing
+  # device once — shortest mountpoint wins, which is the one worth naming.
+  while read -r source target used size pcent; do
+    [[ -n ${seen[$source]} ]] && continue
+    seen[$source]=1
+    pcent=${pcent//[^0-9]/}
+    [[ $target == / ]] && root_pct=$((10#0$pcent))
+    jstr "$target"; jt=$jstr_out
+    jstr "$used"; ju=$jstr_out
+    jstr "$size"; js=$jstr_out
+    printf -v entry '{"target":%s,"used":%s,"size":%s,"pct":%d}' \
+      "$jt" "$ju" "$js" "$((10#0$pcent))"
+    mounts+="${mounts:+,}$entry"
+  done < <(df -h --output=source,target,used,size,pcent \
+    -x tmpfs -x devtmpfs -x efivarfs -x squashfs -x overlay -x fuse.portal 2>/dev/null |
+    tail -n +2 | awk '{ print length($2), $0 }' | sort -n -k1,1 -k3,3 | cut -d" " -f2-)
+}
+
+# ---------------------------------------------------------------- loop
+
+first=1
+uptime_s=0
+
+while :; do
+  sample_cpu
+  sample_mem
+  sample_net
+  sample_disk_io
+  ((disk_tick % df_every == 0)) && refresh_df
+  disk_tick=$((disk_tick + 1))
+
+  read -r uptime_s _ < /proc/uptime
+  uptime_s=${uptime_s%%.*}
+  read -r load1 load5 load15 _ < /proc/loadavg
+
+  if ((first)); then
+    # The first deltas are measured against boot, so throw them away and take a
+    # quick second sample instead of showing an all-time average.
+    first=0
+    sleep 0.4
+    continue
+  fi
+
+  # Bar label: CPU over disk on the left, download over upload on the right.
+  rate "$net_rx"; net_rx_s=$rate_out
+  rate "$net_tx"; net_tx_s=$rate_out
+  printf -v label '%s %3d%%  %s%4s\v%s %3d%%  %s%4s' \
+    "$cpu_icon" "$cpu_pct" "$dn" "$net_rx_s" \
+    "$disk_icon" "$root_pct" "$up" "$net_tx_s"
+
+  jstr "$label"; jlabel=$jstr_out
+  jstr "$load1 $load5 $load15"; jload=$jstr_out
+
+  printf '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]}}\n' \
+    "$jlabel" "$uptime_s" \
+    "$cpu_pct" "${cpu_temp:-null}" "$jload" "$ncpu" "$cores" \
+    "$mem_used" "$mem_total" "$mem_pct" "$swap_used" "$swap_total" "$swap_pct" \
+    "$net_rx" "$net_tx" "$net_ifaces" \
+    "$root_pct" "$disk_r" "$disk_w" "$mounts"
+
+  sleep "$interval"
+done

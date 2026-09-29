@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "navjottomer.sysmon",
+  "name": "System monitor",
+  "version": "1.0.0",
+  "author": "navjottomer",
+  "description": "CPU, disk and network at a glance, with a panel breakdown and a shortcut to btop",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "System monitor",
+    "description": "CPU, disk and network at a glance",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
