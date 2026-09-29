@@ -230,6 +230,97 @@ refresh_df() {
     tail -n +2 | awk '{ print length($2), $0 }' | sort -n -k1,1 -k3,3 | cut -d" " -f2-)
 }
 
+# ---------------------------------------------------------------- gpu
+
+# AMD cards expose load, VRAM and sensors as plain sysfs files, so they cost
+# a few reads per tick. Found once at startup.
+declare -a amd_dev=() amd_hwmon=()
+for card in /sys/class/drm/card[0-9]; do
+  [[ -r $card/device/vendor && -r $card/device/gpu_busy_percent ]] || continue
+  [[ $(<"$card/device/vendor") == 0x1002 ]] || continue
+  amd_dev+=("$card/device")
+  hw=""
+  for h in "$card"/device/hwmon/hwmon*; do [[ -d $h ]] && hw=$h && break; done
+  amd_hwmon+=("$hw")
+done
+
+# NVIDIA has no sysfs counters; nvidia-smi's own loop mode (-lms) keeps one
+# long-lived process that prints a CSV line per GPU each interval. The loop
+# below only drains whatever it has written, so a tick still forks nothing.
+# If it dies (driver reload), it is restarted every 30 ticks.
+nv_lines=() nv_restart=0
+start_nvsmi() {
+  command -v nvidia-smi >/dev/null 2>&1 || return
+  coproc NVSMI {
+    exec nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw \
+      --format=csv,noheader,nounits -lms $((interval * 1000)) 2>/dev/null
+  }
+}
+start_nvsmi
+trap '[[ -n ${NVSMI_PID:-} ]] && kill "$NVSMI_PID" 2>/dev/null' EXIT
+trap 'exit 0' TERM INT HUP
+
+gpus=""
+
+# Keep the newest line per GPU index; older lines queued since the last tick
+# are simply overwritten.
+drain_nvsmi() {
+  local line idx
+  if [[ -z ${NVSMI_PID:-} ]] || ! kill -0 "$NVSMI_PID" 2>/dev/null; then
+    nv_lines=()
+    if ((nv_restart++ % 30 == 0)); then start_nvsmi; fi
+    return
+  fi
+  while read -r -t 0 -u "${NVSMI[0]}" 2>/dev/null; do
+    IFS= read -r -u "${NVSMI[0]}" line || break
+    idx=${line%%,*}
+    [[ $idx =~ ^[0-9]+$ ]] && nv_lines[idx]=$line
+  done
+}
+
+num_or_null() { # $1 -> integer text, or null when not a number
+  [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && num_out=${1%%.*} || num_out=null
+}
+
+sample_gpu() {
+  local line idx name util mused mtotal temp power entry i busy vused vtotal t pw jn
+  gpus=""
+  drain_nvsmi
+  for line in "${nv_lines[@]}"; do
+    IFS=',' read -r idx name util mused mtotal temp power <<<"$line"
+    name=${name# } name=${name#NVIDIA } name=${name#GeForce }
+    jstr "$name"; jn=$jstr_out
+    num_or_null "${util// /}"; util=$num_out
+    num_or_null "${mused// /}"; mused=$num_out
+    num_or_null "${mtotal// /}"; mtotal=$num_out
+    num_or_null "${temp// /}"; temp=$num_out
+    num_or_null "${power// /}"; power=$num_out
+    [[ $mused != null ]] && mused=$((mused * 1048576))
+    [[ $mtotal != null ]] && mtotal=$((mtotal * 1048576))
+    printf -v entry '{"name":%s,"pct":%s,"memUsed":%s,"memTotal":%s,"temp":%s,"power":%s}' \
+      "$jn" "$util" "$mused" "$mtotal" "$temp" "$power"
+    gpus+="${gpus:+,}$entry"
+  done
+  for i in "${!amd_dev[@]}"; do
+    busy=null vused=null vtotal=null t=null pw=null
+    read -r busy < "${amd_dev[i]}/gpu_busy_percent" 2>/dev/null
+    read -r vused < "${amd_dev[i]}/mem_info_vram_used" 2>/dev/null
+    read -r vtotal < "${amd_dev[i]}/mem_info_vram_total" 2>/dev/null
+    if [[ -n ${amd_hwmon[i]} ]]; then
+      read -r t < "${amd_hwmon[i]}/temp1_input" 2>/dev/null && t=$((t / 1000))
+      read -r pw < "${amd_hwmon[i]}/power1_input" 2>/dev/null && pw=$((pw / 1000000))
+    fi
+    num_or_null "$busy"; busy=$num_out
+    num_or_null "$vused"; vused=$num_out
+    num_or_null "$vtotal"; vtotal=$num_out
+    num_or_null "$t"; t=$num_out
+    num_or_null "$pw"; pw=$num_out
+    printf -v entry '{"name":"Radeon Graphics","pct":%s,"memUsed":%s,"memTotal":%s,"temp":%s,"power":%s}' \
+      "$busy" "$vused" "$vtotal" "$t" "$pw"
+    gpus+="${gpus:+,}$entry"
+  done
+}
+
 # ---------------------------------------------------------------- loop
 
 first=1
@@ -240,6 +331,7 @@ while :; do
   sample_mem
   sample_net
   sample_disk_io
+  sample_gpu
   ((disk_tick % df_every == 0)) && refresh_df
   disk_tick=$((disk_tick + 1))
 
@@ -265,12 +357,12 @@ while :; do
   jstr "$label"; jlabel=$jstr_out
   jstr "$load1 $load5 $load15"; jload=$jstr_out
 
-  printf '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]}}\n' \
+  printf '{"label":%s,"uptime":%d,"cpu":{"pct":%d,"temp":%s,"load":%s,"threads":%d,"cores":[%s]},"mem":{"used":%d,"total":%d,"pct":%d,"swapUsed":%d,"swapTotal":%d,"swapPct":%d},"net":{"rx":%d,"tx":%d,"ifaces":[%s]},"disk":{"pct":%d,"read":%d,"write":%d,"mounts":[%s]},"gpus":[%s]}\n' \
     "$jlabel" "$uptime_s" \
     "$cpu_pct" "${cpu_temp:-null}" "$jload" "$ncpu" "$cores" \
     "$mem_used" "$mem_total" "$mem_pct" "$swap_used" "$swap_total" "$swap_pct" \
     "$net_rx" "$net_tx" "$net_ifaces" \
-    "$root_pct" "$disk_r" "$disk_w" "$mounts"
+    "$root_pct" "$disk_r" "$disk_w" "$mounts" "$gpus"
 
   sleep "$interval"
 done

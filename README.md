@@ -1,6 +1,6 @@
 # navjottomer.sysmon
 
-CPU / memory / disk / network for the Omarchy bar. Click the bar label to open
+CPU / memory / GPU / disk / network for the Omarchy bar. Click the bar label to open
 the breakdown; right-click (or Enter in the panel) jumps straight to btop.
 
 ## Install
@@ -28,6 +28,12 @@ The script's hot path only reads `/proc` and `/sys` and writes results through
 external binaries. `df` runs every 15th tick and `sleep` once per tick; that is
 all. Measured over a 12s window: ~0ms CPU, against ~10ms for the earlier
 version that used command substitution.
+
+GPU: AMD load, VRAM and sensors are sysfs reads like the rest. NVIDIA has no
+sysfs counters, so one long-lived `nvidia-smi -lms 2000` runs alongside
+(~27 MB, ~0ms CPU per 12s) and the loop drains its latest line each tick,
+still without forking. It is started with the script and killed with it.
+With GPU sampling the script measures ~10ms CPU per 12s.
 
 On the QML side, a tick while the panel is **closed** costs one property write.
 `snapshot` holds the payload with nothing bound to it, and the detail

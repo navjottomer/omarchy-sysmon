@@ -30,6 +30,7 @@ Panel {
   property var cores: []
   property var ifaces: []
   property var mounts: []
+  property var gpus: []
 
   readonly property string ff: bar ? bar.fontFamily : Style.font.family
   readonly property color dimForeground: Qt.darker(barForeground, 1.4)
@@ -71,6 +72,14 @@ Panel {
     return scaled(v / 1073741824, "G")
   }
 
+  // "32%  ·  41°C  ·  12W", skipping any figure the driver did not report.
+  function gpuSummary(g) {
+    var parts = [(g.pct === null || g.pct === undefined ? "—" : g.pct) + "%"]
+    if (g.temp !== null && g.temp !== undefined) parts.push(g.temp + "°C")
+    if (g.power) parts.push(g.power + "W")
+    return parts.join("  ·  ")
+  }
+
   function fmtUptime(seconds) {
     var s = Number(seconds) || 0
     var d = Math.floor(s / 86400)
@@ -92,6 +101,7 @@ Panel {
     cores = (d.cpu && d.cpu.cores) || []
     ifaces = (d.net && d.net.ifaces) || []
     mounts = (d.disk && d.disk.mounts) || []
+    gpus = d.gpus || []
   }
 
   onOpenedChanged: if (opened) applySnapshot()
@@ -365,6 +375,53 @@ Panel {
             value: root.fmtBytes(root.num(root.mem, "swapUsed", 0)) + " / "
                    + root.fmtBytes(root.num(root.mem, "swapTotal", 0))
                    + "   " + root.num(root.mem, "swapPct", 0) + "%"
+          }
+        }
+
+        PanelSeparator {
+          visible: root.gpus.length > 0
+          foreground: root.barForeground
+        }
+
+        // ---------- GPU ----------
+        // One pair of rows per GPU: load, temperature and power on the first,
+        // video memory on the second.
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
+          visible: root.gpus.length > 0
+
+          PanelSectionHeader {
+            text: "GPU"
+            foreground: root.barForeground
+            fontFamily: root.ff
+          }
+
+          Repeater {
+            model: root.gpus.length
+
+            Column {
+              required property int index
+              readonly property var gpu: root.gpus[index] || ({})
+              width: parent.width
+              spacing: Style.space(6)
+
+              StatRow {
+                icon: "󰢮"
+                key: String(gpu.name || "GPU")
+                value: root.gpuSummary(gpu)
+                valueColor: Number(gpu.pct) >= 85 ? (root.bar ? root.bar.urgent : Color.urgent) : root.barForeground
+              }
+
+              StatRow {
+                icon: "󰍛"
+                key: "VRAM"
+                visible: Number(gpu.memTotal) > 0
+                value: root.fmtBytes(gpu.memUsed) + " / " + root.fmtBytes(gpu.memTotal)
+                       + "   " + Math.round(100 * Number(gpu.memUsed) / Number(gpu.memTotal)) + "%"
+                valueColor: root.dimForeground
+              }
+            }
           }
         }
 
