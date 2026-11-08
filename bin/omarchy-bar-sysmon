@@ -248,6 +248,9 @@ refresh_df() {
   # Btrfs subvolumes all report the same filesystem, so list each backing
   # device once — shortest mountpoint wins, which is the one worth naming.
   while read -r source target used size pcent; do
+    # AppImages mount their read-only image at /tmp/.mount_XXXX as
+    # fuse.<name>.AppImage, which -x squashfs can't catch; always "100% full".
+    [[ $target == */.mount_* ]] && continue
     [[ -n ${seen[$source]} ]] && continue
     seen[$source]=1
     ((${#seen[@]} > max_mounts)) && continue
